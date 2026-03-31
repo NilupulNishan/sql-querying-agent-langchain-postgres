@@ -356,3 +356,69 @@ def answer_node(state: AgentState) -> dict:
  
     print(f"[answer_node] Final answer: {final}")
     return {"final_answer": final}
+
+
+# ============================================================
+# 7. Build the LangGraph graph
+# ============================================================
+ 
+def build_agent_graph() -> Any:
+    """
+    Wire up the four nodes into a LangGraph StateGraph.
+    Flow: schema → generate_code → execute_code → answer → END
+    """
+    # Create graph
+    graph = StateGraph(AgentState)
+
+    # Register nodes
+    graph.add_node("schema_node", schema_node)
+    graph.add_node("generate_code_node", generate_code_node)
+    graph.add_node("execute_code_node", execute_code_node)
+    graph.add_node("answer_node", answer_node)
+
+    # Define edges
+    graph.set_entry_point("schema_node")
+    graph.add_edge("schema_node", "generate_code_node")
+    graph.add_edge("generate_code_node", "execute_code_node")
+    graph.add_edge("execute_code_node", "answer_node")
+    graph.add_edge("answer_node", END)
+
+    return graph.compile()
+
+
+# ============================================================
+# 8. Public function — run a single question through the agent
+# ============================================================
+ 
+def run_agent(question: str) -> str:
+    """
+    Main entry point. Takes a natural language question,
+    runs it through the full graph, returns the answer string.
+    """
+    app = build_agent_graph()
+ 
+    initial_state: AgentState = {
+        "question":          question,
+        "schema_block":      "",
+        "raw_llm_response":  "",
+        "extracted_code":    "",
+        "stdout_log":        "",
+        "execution_error":   None,
+        "answer_text":       None,
+        "status":            None,
+        "final_answer":      "",
+    }
+ 
+    final_state = app.invoke(initial_state)
+    return final_state["final_answer"]
+
+
+import sys
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        question = " ".join(sys.argv[1:])
+    else:
+        question = input("Ask your question: ")
+
+    print(run_agent(question))

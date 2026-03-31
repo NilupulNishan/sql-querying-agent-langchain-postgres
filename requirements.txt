@@ -1,0 +1,7 @@
+langchain
+langchain-openai
+langgraph
+psycopg2-binary
+sqlalchemy
+python-dotenv
+openai

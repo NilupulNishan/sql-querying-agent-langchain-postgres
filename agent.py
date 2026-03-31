@@ -66,7 +66,7 @@ Database Schema & Samples (read-only):
  
 Execution Environment (already available in the sandbox):
 - Variable: conn  (a psycopg2 read-only connection — already open)
-- Use: conn.cursor() or psycopg2.extras.RealDictCursor for dict rows
+- Use: conn.cursor(cursor_factory=RealDictCursor) for dict rows
 - Standard library (re, datetime) is available
 - This is READ-ONLY. NEVER write INSERT, UPDATE, DELETE, or DDL.
  
@@ -119,6 +119,20 @@ TONE EXAMPLES (for answer_text):
 - insufficient_stock: "We only have 1 pair of Classic left; I can reserve that for you."
 - invalid_request: "I can help—how many pairs would you like?"
  
+IMPORTANT RULES:
+
+- Do NOT use any import statements
+- Do NOT write: import re, import psycopg2, or from ... import ...
+- The following are already available:
+    - re
+    - datetime
+    - psycopg2
+    - RealDictCursor
+    - conn
+    - user_request
+
+- Always use the provided objects directly
+
 User request:
 {question}
 """
@@ -190,6 +204,33 @@ def execute_generated_code(
     """
     # Extract just the code portion
     code = _extract_execute_block(code_or_content)
+
+    # ==============================
+    # SANITIZE LLM GENERATED CODE
+    # ==============================
+
+    # 1. Remove ALL import statements
+    cleaned_lines = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("import ") or stripped.startswith("from "):
+            continue
+        cleaned_lines.append(line)
+
+    code = "\n".join(cleaned_lines)
+
+    # 2. Fix RealDictCursor usage (LLM often writes full path)
+    code = code.replace("psycopg2.extras.RealDictCursor", "RealDictCursor")
+
+    # 3. Block dangerous patterns (extra safety)
+    if "__import__" in code or "os." in code or "subprocess" in code:
+        return {
+            "code": code,
+            "stdout": "",
+            "error": "Unsafe code detected",
+            "answer_text": None,
+            "status": "blocked",
+        }
  
     # ---- Safe sandbox globals ----
     # Only expose what the generated code needs.

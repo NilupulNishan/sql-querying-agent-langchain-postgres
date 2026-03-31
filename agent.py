@@ -156,3 +156,203 @@ def _extract_execute_block(text: str) -> str:
         re.DOTALL | re.IGNORECASE,
     )
     return m.group(1).strip() if m else text.strip()
+
+
+# ============================================================
+# 5. execute_generated_code — same as notebook, but sandbox
+#    uses psycopg2 conn instead of TinyDB tables
+# ============================================================
+ 
+def execute_generated_code(
+    code_or_content: str,
+    *,
+    conn: psycopg2.extensions.connection,
+    user_request: str = "",
+) -> dict[str, Any]:
+    """
+    Execute LLM-generated code in a controlled sandbox.
+    Accepts either raw Python OR full LLM content with <execute_python> tags.
+ 
+    The sandbox provides:
+      - conn: read-only psycopg2 connection
+      - psycopg2.extras: for RealDictCursor
+      - re, datetime: standard library helpers
+      - user_request: the original question string
+ 
+    Returns:
+      {
+        "code":         extracted Python string,
+        "stdout":       captured print() output,
+        "error":        traceback string or None,
+        "answer_text":  the answer_text variable set by the code,
+        "status":       the STATUS variable set by the code,
+      }
+    """
+    # Extract just the code portion
+    code = _extract_execute_block(code_or_content)
+ 
+    # ---- Safe sandbox globals ----
+    # Only expose what the generated code needs.
+    # __builtins__ is restricted to prevent imports of dangerous modules.
+    import re as _re
+    import datetime as _datetime
+ 
+    SAFE_GLOBALS = {
+        "__builtins__": {
+            # Basic builtins the code might need
+            "print": print,
+            "len": len,
+            "str": str,
+            "int": int,
+            "float": float,
+            "bool": bool,
+            "list": list,
+            "dict": dict,
+            "tuple": tuple,
+            "range": range,
+            "enumerate": enumerate,
+            "zip": zip,
+            "min": min,
+            "max": max,
+            "abs": abs,
+            "round": round,
+            "sorted": sorted,
+            "any": any,
+            "all": all,
+            "isinstance": isinstance,
+            "None": None,
+            "True": True,
+            "False": False,
+        },
+        # Libraries the generated code needs
+        "re": _re,
+        "datetime": _datetime,
+        "psycopg2": psycopg2,
+        # Convenience shortcut so the LLM can write:
+        # with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        "RealDictCursor": psycopg2.extras.RealDictCursor,
+    }
+ 
+    SAFE_LOCALS = {
+        "conn": conn,
+        "user_request": user_request,
+    }
+ 
+    # ---- Capture stdout ----
+    stdout_buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = stdout_buf
+    error_text = None
+ 
+    try:
+        exec(code, SAFE_GLOBALS, SAFE_LOCALS)  # noqa: S102
+    except Exception:
+        error_text = traceback.format_exc()
+    finally:
+        sys.stdout = old_stdout
+ 
+    captured_stdout = stdout_buf.getvalue().strip()
+ 
+    return {
+        "code":        code,
+        "stdout":      captured_stdout,
+        "error":       error_text,
+        "answer_text": SAFE_LOCALS.get("answer_text"),
+        "status":      SAFE_LOCALS.get("STATUS", "unknown"),
+    }
+
+
+# ============================================================
+# 6. LangGraph Nodes
+# Each node is a plain Python function that receives the state,
+# does one thing, and returns a dict of updates to the state.
+# ============================================================
+def schema_node(state: AgentState) -> dict:
+    """Node 1: Connect to PostgreSQL and build the schema description."""
+
+    print("[schema_node] Connecting to PostgreSQL and building schema...")
+    conn = db_utils.get_connection()
+    schema = db_utils.build_schema_block(conn)
+    conn.close()
+    print("[schema_node] Schema built successfully.")
+    return {"schema_block": schema}
+
+
+def generate_code_node(state: AgentState) -> dict:
+    """Node 2: Ask the LLM to write Python code as the plan."""
+
+    print("[generate_code_node] Asking LLM to generate plan-as-code...")
+    llm = get_llm()
+ 
+    prompt = PROMPT_TEMPLATE.format(
+        schema_block=state["schema_block"],
+        question=state["question"],
+    )
+ 
+    # LangChain message format
+    from langchain_core.messages import HumanMessage, SystemMessage
+    messages = [
+        SystemMessage(content="You write safe, well-commented psycopg2 Python code to answer data questions."),
+        HumanMessage(content=prompt),
+    ]
+ 
+    response = llm.invoke(messages)
+    raw_content = response.content or ""
+    print("[generate_code_node] LLM response received.")
+    print("--- RAW LLM RESPONSE ---")
+    print(raw_content)
+    print("------------------------")
+    return {"raw_llm_response": raw_content}
+
+
+def execute_code_node(state: AgentState) -> dict:
+    """
+    Node 3: Extract the <execute_python> block and run it safely.
+    Mirrors execute_generated_code() from the notebook, but uses PostgreSQL.
+    """
+    print("[execute_code_node] Extracting and executing generated code...")
+ 
+    # Open a fresh read-only connection for the sandbox
+    conn = db_utils.get_connection()
+ 
+    try:
+        result = execute_generated_code(
+            state["raw_llm_response"],
+            conn=conn,
+            user_request=state["question"],
+        )
+    finally:
+        conn.close()
+ 
+    print(f"[execute_code_node] stdout: {result['stdout']}")
+    if result["error"]:
+        print(f"[execute_code_node] ERROR:\n{result['error']}")
+ 
+    return {
+        "extracted_code": result["code"],
+        "stdout_log":     result["stdout"],
+        "execution_error": result["error"],
+        "answer_text":    result["answer_text"],
+        "status":         result["status"],
+    }
+
+
+def answer_node(state: AgentState) -> dict:
+    """
+    Node 4: Compose the final answer shown to the user.
+    If the code crashed, return a friendly fallback message.
+    """
+    if state.get("execution_error"):
+        final = (
+            "Sorry, I ran into a problem processing your request. "
+            "Please try rephrasing your question."
+        )
+        print(f"[answer_node] Execution error detected, returning fallback.")
+        print(f"[answer_node] Error was:\n{state['execution_error']}")
+    elif state.get("answer_text"):
+        final = state["answer_text"]
+    else:
+        final = "I couldn't find a clear answer. Could you rephrase your question?"
+ 
+    print(f"[answer_node] Final answer: {final}")
+    return {"final_answer": final}
